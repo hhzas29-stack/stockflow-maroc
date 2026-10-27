@@ -203,10 +203,12 @@ def dashboard():
                 # Marge brute estimée par mouvement : prix de sortie enregistré moins coût d'achat actuel du produit.
                 costs=p.set_index("id")["purchase_price"].to_dict()
                 sales["gross_profit"]=[float(r.total_value)-float(r.quantity)*float(costs.get(r.product_id,0)) for r in sales.itertuples()]
-                profit_daily=sales.groupby("date",as_index=False).agg(**{"Bénéfice brut estimé (DH)":("gross_profit","sum")})
-                fig=px.line(profit_daily,x="date",y="Bénéfice brut estimé (DH)",markers=True)
-                fig.update_layout(height=340,margin=dict(l=5,r=10,t=20,b=5),xaxis_title="Date",yaxis_title="DH")
+                sales_daily=sales.groupby("date",as_index=False).agg(**{"Ventes (DH)":("total_value","sum"),"Bénéfice brut estimé (DH)":("gross_profit","sum")})
+                sales_long=sales_daily.melt(id_vars="date",var_name="Indicateur",value_name="Montant (DH)")
+                fig=px.line(sales_long,x="date",y="Montant (DH)",color="Indicateur",markers=True)
+                fig.update_layout(height=340,margin=dict(l=5,r=10,t=20,b=5),xaxis_title="Date",yaxis_title="DH",legend_title="")
                 st.plotly_chart(fig,use_container_width=True)
+                st.caption("Le bénéfice est estimatif : il utilise le prix d'achat actuel du produit, pas nécessairement son coût historique au moment de la sortie.")
             else: st.info("Les sorties enregistrées apparaîtront ici.")
         else: st.info("Enregistrez des mouvements pour alimenter le graphique.")
     st.subheader("🚨 Produits à surveiller")
