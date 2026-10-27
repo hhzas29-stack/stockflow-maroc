@@ -15,6 +15,7 @@ import io
 import math
 import os
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -460,6 +461,91 @@ def product_labels(df: pd.DataFrame) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Import en lot depuis Excel / CSV
+# --------------------------------------------------------------------------- #
+def _normalize_column(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    return "".join(ch for ch in text.lower().strip() if ch.isalnum())
+
+
+IMPORT_ALIASES = {
+    "reference": {"reference", "ref", "sku", "code", "productreference"},
+    "name": {"name", "nom", "produit", "product", "productname", "designation", "designationproduit"},
+    "quantity": {"quantity", "quantite", "qty", "stock", "stockquantity"},
+    "purchase_price": {"purchaseprice", "prixachat", "buyprice", "cost", "costprice"},
+    "selling_price": {"sellingprice", "prixvente", "saleprice", "sellprice"},
+    "min_stock": {"minstock", "seuilalerte", "stockminimum", "minimum", "alertthreshold"},
+}
+
+
+def import_products_from_file(uploaded_file) -> tuple[int, int, list[str]]:
+    """Importe des produits sans écraser les références déjà présentes."""
+    filename = (uploaded_file.name or "").lower()
+    try:
+        if filename.endswith((".xlsx", ".xls")):
+            source = pd.read_excel(uploaded_file)
+        elif filename.endswith(".csv"):
+            try:
+                source = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                uploaded_file.seek(0)
+                source = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="latin-1")
+        else:
+            raise StockError("Format non pris en charge. Utilisez un fichier .xlsx, .xls ou .csv.")
+    except StockError:
+        raise
+    except Exception as exc:
+        raise StockError(f"Impossible de lire le fichier : {exc}") from None
+
+    if source.empty:
+        raise StockError("Le fichier ne contient aucune ligne à importer.")
+
+    normalized = {_normalize_column(col): col for col in source.columns}
+    selected = {}
+    for field, aliases in IMPORT_ALIASES.items():
+        for alias in aliases:
+            if alias in normalized:
+                selected[field] = normalized[alias]
+                break
+    missing = [field for field in ("reference", "name", "quantity", "purchase_price", "selling_price") if field not in selected]
+    if missing:
+        labels = {"reference": "Référence", "name": "Nom du produit", "quantity": "Quantité", "purchase_price": "Prix d'achat", "selling_price": "Prix de vente"}
+        raise StockError("Colonnes obligatoires manquantes : " + ", ".join(labels[x] for x in missing) + ".")
+
+    created = 0
+    skipped = 0
+    errors = []
+    for idx, row in source.iterrows():
+        excel_line = idx + 2
+        try:
+            ref = str(row[selected["reference"]]).strip()
+            name = str(row[selected["name"]]).strip()
+            if ref.lower() in ("", "nan", "none") or name.lower() in ("", "nan", "none"):
+                raise StockError("référence ou nom manquant")
+            qty = row[selected["quantity"]]
+            buy = row[selected["purchase_price"]]
+            sell = row[selected["selling_price"]]
+            minimum = row[selected["min_stock"]] if "min_stock" in selected and pd.notna(row[selected["min_stock"]]) else DEFAULT_MIN_STOCK
+            add_product(ref, name, qty, buy, sell, minimum)
+            created += 1
+        except StockError as exc:
+            skipped += 1
+            errors.append(f"Ligne {excel_line} ({row.get(selected.get('reference', ''), '?')}): {exc}")
+        except (ValueError, TypeError, KeyError) as exc:
+            skipped += 1
+            errors.append(f"Ligne {excel_line}: données invalides ({exc}).")
+    return created, skipped, errors[:20]
+
+
+def import_template_bytes() -> bytes:
+    template = pd.DataFrame([
+        {"Reference": "HUI-001", "Name": "Huile d'olive 1 L", "Quantity": 40,
+         "Purchase Price": 38.0, "Selling Price": 52.0, "Min Stock": 10}
+    ])
+    return to_excel_bytes({"Import template": template})
+
+
+# --------------------------------------------------------------------------- #
 # Pages
 # --------------------------------------------------------------------------- #
 def page_dashboard() -> None:
@@ -688,15 +774,46 @@ def tab_edit_delete() -> None:
             st.rerun()
 
 
+def tab_import_products() -> None:
+    st.subheader("Importer un inventaire depuis Excel ou CSV")
+    st.write("Importez plusieurs produits en une seule fois. Les références déjà présentes ne seront pas écrasées.")
+    st.download_button(
+        "📄 Télécharger le modèle Excel",
+        data=import_template_bytes(),
+        file_name="modele_import_stockflow.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+    st.caption("Colonnes nécessaires : Reference, Name, Quantity, Purchase Price, Selling Price. "
+               "Min Stock est facultative. Les noms de colonnes en français sont également acceptés.")
+    uploaded = st.file_uploader("Choisir un fichier Excel ou CSV", type=["xlsx", "xls", "csv"], key="products_import_file")
+    if uploaded is not None and st.button("⬆️ Importer les produits", type="primary", key="products_import_button"):
+        try:
+            created, skipped, errors = import_products_from_file(uploaded)
+            if created:
+                st.success(f"Import terminé : {created} produit(s) ajouté(s).")
+            if skipped:
+                st.warning(f"{skipped} ligne(s) ignorée(s) : doublons ou données invalides.")
+            if errors:
+                with st.expander("Voir les détails des lignes ignorées"):
+                    for error in errors:
+                        st.write(f"- {error}")
+            if created:
+                st.rerun()
+        except StockError as exc:
+            st.error(str(exc))
+
+
 def page_products() -> None:
     st.title("📦 Produits")
-    tab1, tab2, tab3 = st.tabs(["Inventaire", "Ajouter", "Modifier / Supprimer"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Inventaire", "Ajouter", "Modifier / Supprimer", "Importer Excel / CSV"])
     with tab1:
         tab_inventory()
     with tab2:
         tab_add()
     with tab3:
         tab_edit_delete()
+    with tab4:
+        tab_import_products()
 
 
 def movements_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -788,12 +905,21 @@ def tab_history() -> None:
     show_table(movements_frame(view))
     plain = movements_frame(view)
     plain["Type"] = view["type"].values
-    st.download_button(
-        "⬇️ Exporter l'historique (CSV)",
-        data=to_csv_bytes(plain),
-        file_name=f"mouvements_stockflow_{datetime.now():%Y-%m-%d}.csv",
-        mime="text/csv",
-    )
+    c_csv, c_excel = st.columns(2)
+    with c_csv:
+        st.download_button(
+            "⬇️ Exporter l'historique (CSV)",
+            data=to_csv_bytes(plain),
+            file_name=f"mouvements_stockflow_{datetime.now():%Y-%m-%d}.csv",
+            mime="text/csv",
+        )
+    with c_excel:
+        st.download_button(
+            "📊 Exporter l'historique (Excel)",
+            data=to_excel_bytes({"Mouvements": plain}),
+            file_name=f"mouvements_stockflow_{datetime.now():%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 def page_movements() -> None:
