@@ -11,6 +11,7 @@ Lancement :  streamlit run app.py
 
 from __future__ import annotations
 
+import io
 import math
 import os
 import sqlite3
@@ -323,6 +324,22 @@ def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
 
 
+def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> bytes:
+    """Crée un classeur Excel téléchargeable contenant les feuilles demandées."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for sheet_name, frame in sheets.items():
+            frame.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+            worksheet = writer.sheets[sheet_name[:31]]
+            worksheet.freeze_panes = "A2"
+            worksheet.auto_filter.ref = worksheet.dimensions
+            for cells in worksheet.columns:
+                max_length = max((len(str(cell.value or "")) for cell in cells), default=0)
+                worksheet.column_dimensions[cells[0].column_letter].width = min(max(max_length + 2, 12), 38)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def fmt_money(value: float) -> str:
     text = f"{value:,.2f}".replace(",", "\u00a0").replace(".", ",")
     return f"{text}\u00a0{CURRENCY}"
@@ -535,12 +552,21 @@ def tab_inventory() -> None:
         shown["Statut"] = shown["Statut"].map(STATUS_ICONS)
         show_table(shown, inventory_column_config())
 
-    st.download_button(
-        "⬇️ Exporter tout l'inventaire (CSV)",
-        data=to_csv_bytes(inventory_frame(df)),
-        file_name=f"inventaire_stockflow_{datetime.now():%Y-%m-%d}.csv",
-        mime="text/csv",
-    )
+    c_csv, c_excel = st.columns(2)
+    with c_csv:
+        st.download_button(
+            "⬇️ Inventaire (CSV)",
+            data=to_csv_bytes(inventory_frame(df)),
+            file_name=f"inventaire_stockflow_{datetime.now():%Y-%m-%d}.csv",
+            mime="text/csv",
+        )
+    with c_excel:
+        st.download_button(
+            "📊 Inventaire (Excel)",
+            data=to_excel_bytes({"Inventaire": inventory_frame(df)}),
+            file_name=f"inventaire_stockflow_{datetime.now():%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 
 def tab_add() -> None:
@@ -767,6 +793,28 @@ def main() -> None:
     page = st.sidebar.radio("Navigation", list(PAGES), label_visibility="collapsed")
     st.sidebar.divider()
     st.sidebar.caption(f"Base de données : {DB_PATH.name}")
+    st.sidebar.warning(
+        "Sauvegardez régulièrement vos données. Sur un hébergement gratuit, "
+        "la base locale peut être réinitialisée après un redémarrage."
+    )
+    try:
+        backup_products = fetch_products()
+        backup_movements = fetch_movements()
+        backup_inventory = inventory_frame(backup_products) if not backup_products.empty else pd.DataFrame(
+            columns=list(INVENTORY_COLUMNS.values())
+        )
+        backup_history = movements_frame(backup_movements) if not backup_movements.empty else pd.DataFrame(
+            columns=["Date", "Référence", "Produit", "Type", "Quantité", "Note"]
+        )
+        st.sidebar.download_button(
+            "💾 Télécharger la sauvegarde Excel",
+            data=to_excel_bytes({"Inventaire": backup_inventory, "Mouvements": backup_history}),
+            file_name=f"sauvegarde_stockflow_{datetime.now():%Y-%m-%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    except (sqlite3.Error, pd.errors.DatabaseError, ValueError):
+        st.sidebar.caption("La sauvegarde sera disponible après le chargement de la base.")
 
     show_flash()
     try:
