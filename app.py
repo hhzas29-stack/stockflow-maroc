@@ -385,18 +385,31 @@ def seed_demo() -> None:
 # --------------------------------------------------------------------------- #
 CSS = """
 <style>
-.block-container { padding-top: 2rem; max-width: 1200px; }
+.block-container { padding-top: 1.6rem; max-width: 1320px; }
 [data-testid="stMetric"] {
-    background: rgba(128, 128, 128, 0.08);
+    background: linear-gradient(145deg, rgba(128, 128, 128, 0.10), rgba(128, 128, 128, 0.035));
     border: 1px solid rgba(128, 128, 128, 0.22);
-    border-radius: 12px;
-    padding: 14px 16px;
+    border-radius: 16px;
+    padding: 16px 18px;
+    min-height: 112px;
 }
-[data-testid="stMetricValue"] { font-size: 1.6rem; }
+[data-testid="stMetricLabel"] { font-size: 0.9rem; }
+[data-testid="stMetricValue"] { font-size: 1.65rem; font-weight: 700; }
+[data-testid="stMetricDelta"] { font-size: 0.82rem; }
 div[data-testid="stForm"] { border-radius: 12px; }
+.dashboard-hero {
+    padding: 1.25rem 1.4rem;
+    border: 1px solid rgba(128, 128, 128, 0.22);
+    border-radius: 18px;
+    margin: 0 0 1.1rem 0;
+    background: linear-gradient(120deg, rgba(31, 119, 180, 0.13), rgba(128, 128, 128, 0.04));
+}
+.dashboard-hero h2 { margin: 0 0 .3rem 0; font-size: 1.55rem; }
+.dashboard-hero p { margin: 0; opacity: .78; }
 @media (max-width: 640px) {
     .block-container { padding-left: 1rem; padding-right: 1rem; padding-top: 1rem; }
-    [data-testid="stMetricValue"] { font-size: 1.3rem; }
+    [data-testid="stMetricValue"] { font-size: 1.25rem; }
+    [data-testid="stMetric"] { padding: 12px; min-height: 96px; }
 }
 </style>
 """
@@ -450,13 +463,17 @@ def product_labels(df: pd.DataFrame) -> dict:
 # Pages
 # --------------------------------------------------------------------------- #
 def page_dashboard() -> None:
-    st.title("📊 Tableau de bord")
     df = fetch_products()
+    st.markdown(
+        '<div class="dashboard-hero"><h2>📊 Vue d’ensemble</h2>'
+        "<p>Pilotez votre stock, repérez les alertes et suivez les mouvements récents.</p></div>",
+        unsafe_allow_html=True,
+    )
 
     if df.empty:
         st.info("Bienvenue ! Votre stock est vide. Ajoutez votre premier produit "
                 "dans la page « Produits », ou chargez des données d'exemple.")
-        if st.button("Charger des données d'exemple"):
+        if st.button("Charger des données d'exemple", type="primary"):
             ok, _ = run_action(seed_demo)
             if ok:
                 flash("Données d'exemple chargées.")
@@ -464,28 +481,53 @@ def page_dashboard() -> None:
         return
 
     s = inventory_summary(df)
+    st.caption(f"Dernière actualisation : {datetime.now():%d/%m/%Y à %H:%M}")
 
+    # Indicateurs principaux : les calculs existants sont conservés.
     c1, c2, c3 = st.columns(3)
-    c1.metric("Produits référencés", fmt_int(s["products"]))
-    c2.metric("Unités en stock", fmt_int(s["units"]))
-    c3.metric("Alertes de stock", fmt_int(s["low"] + s["out"]))
+    c1.metric("📦 Produits référencés", fmt_int(s["products"]))
+    c2.metric("🔢 Unités en stock", fmt_int(s["units"]))
+    c3.metric("⚠️ Produits à surveiller", fmt_int(s["low"] + s["out"]))
 
     c4, c5, c6 = st.columns(3)
-    c4.metric("Valeur du stock (achat)", fmt_money(s["stock_value"]))
-    c5.metric("Valeur de vente potentielle", fmt_money(s["sale_value"]))
-    c6.metric("Bénéfice estimé", fmt_money(s["profit"]))
-    st.caption(f"Marge estimée sur le stock actuel : {s['margin']:.1f} %")
+    c4.metric("💰 Valeur du stock (achat)", fmt_money(s["stock_value"]))
+    c5.metric("🏷️ Valeur de vente potentielle", fmt_money(s["sale_value"]))
+    c6.metric("📈 Bénéfice brut estimé", fmt_money(s["profit"]))
+    st.caption(f"Marge estimée sur la valeur de vente du stock actuel : {s['margin']:.1f} % · Montants en DH")
 
-    st.subheader("⚠️ Alertes de stock")
+    st.divider()
+    left, right = st.columns([1, 1.25], gap="large")
+    with left:
+        st.subheader("État du stock")
+        status_counts = pd.DataFrame({
+            "Nombre de produits": [
+                int((df["status"] == STATUS_OK).sum()),
+                int((df["status"] == STATUS_LOW).sum()),
+                int((df["status"] == STATUS_OUT).sum()),
+            ]
+        }, index=["🟢 Stock normal", "🟠 Stock faible", "🔴 Rupture"])
+        st.bar_chart(status_counts, horizontal=True)
+        st.caption("Répartition des produits selon leur seuil d’alerte.")
+    with right:
+        st.subheader("Top 5 — valeur immobilisée")
+        top = df.nlargest(5, "stock_value")[ ["name", "stock_value"] ].copy()
+        if top["stock_value"].sum() > 0:
+            top = top.set_index("name").rename(columns={"stock_value": f"Valeur ({CURRENCY})"})
+            st.bar_chart(top, horizontal=True)
+        else:
+            st.info("Les prix d'achat ne sont pas encore renseignés.")
+        st.caption("Produits dont le stock représente la plus grande valeur d’achat.")
+
+    st.divider()
+    st.subheader("⚠️ Alertes à traiter")
     alerts = df[df["status"] != STATUS_OK]
     if alerts.empty:
         st.success("Aucune alerte : tous les produits sont au-dessus de leur seuil.")
     else:
-        if s["out"]:
-            st.error(f"{s['out']} produit(s) en rupture de stock.")
-        if s["low"]:
-            st.warning(f"{s['low']} produit(s) sous le seuil d'alerte.")
-        view = alerts.sort_values("quantity")[["reference", "name", "quantity", "min_stock", "status"]]
+        a1, a2 = st.columns(2)
+        a1.metric("🟠 Stock faible", fmt_int(s["low"]))
+        a2.metric("🔴 En rupture", fmt_int(s["out"]))
+        view = alerts.sort_values(["quantity", "name"])[["reference", "name", "quantity", "min_stock", "status"]]
         view = view.rename(columns={
             "reference": "Référence", "name": "Produit", "quantity": "Quantité",
             "min_stock": "Seuil d'alerte", "status": "Statut",
@@ -493,12 +535,7 @@ def page_dashboard() -> None:
         view["Statut"] = view["Statut"].map(STATUS_ICONS)
         show_table(view)
 
-    if df["stock_value"].max() > 0:
-        st.subheader("💰 Top 10 : valeur du stock")
-        top = df.nlargest(10, "stock_value")[["reference", "stock_value"]]
-        top = top.set_index("reference").rename(columns={"stock_value": f"Valeur du stock ({CURRENCY})"})
-        st.bar_chart(top)
-
+    st.divider()
     st.subheader("🕑 Derniers mouvements")
     moves = fetch_movements().head(8)
     if moves.empty:
