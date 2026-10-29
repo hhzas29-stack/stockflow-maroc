@@ -1,9 +1,5 @@
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
-venv/
-.env
 .streamlit/secrets.toml
-stockflow.db
-*.sqlite
-*.sqlite3
+.env

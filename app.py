@@ -1,109 +1,164 @@
 # -*- coding: utf-8 -*-
-"""StockFlow Maroc — gestion de stock, fournisseurs, mouvements et analyses."""
+"""StockFlow Maroc — gestion de stock, fournisseurs, mouvements et analyses.
+
+Modèle de sécurité (multi-utilisateurs)
+---------------------------------------
+1. Authentification : Supabase Auth (email + mot de passe), via `supabase_auth.py`.
+   Aucune page ni aucune donnée n'est accessible sans session valide.
+2. Isolation des données : PostgreSQL Row Level Security (voir
+   `migrations/001_auth_rls.sql`). Chaque ligne porte un `user_id` et les
+   politiques n'autorisent que `user_id = auth.uid()`.
+3. Toutes les requêtes passent par Supabase REST/PostgREST avec le jeton
+   utilisateur : Supabase valide le JWT avant que PostgreSQL applique la RLS.
+   Les opérations critiques multi-étapes sont des RPC SECURITY INVOKER.
+4. Secrets : seuls SUPABASE_URL et SUPABASE_ANON_KEY (clé publique) sont utilisés.
+   La clé `service_role` et `DATABASE_URL` ne sont jamais utilisés.
+"""
 from __future__ import annotations
 
 import io
+import logging
 import os
-from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.express as px
-import psycopg
-from psycopg.rows import dict_row
+import requests
 import streamlit as st
+
+import supabase_auth as sa
 
 APP_NAME = "StockFlow Maroc"
 CURRENCY = "DH"
 MOVE_IN, MOVE_OUT = "Entrée", "Sortie"
 LOW_DAYS = 30
 
+log = logging.getLogger("stockflow")
 
-def database_url() -> str:
-    """Read the PostgreSQL URL from Streamlit Secrets, with env fallback for local use."""
+NOT_FOUND_MSG = "Élément introuvable ou accès refusé."
+REQUIRED_TABLES = ("suppliers", "products", "movements")
+
+
+class SafeError(RuntimeError):
+    """Erreur dont le message peut être affiché tel quel à l'utilisateur."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration / secrets
+# ---------------------------------------------------------------------------
+def get_secret(name: str) -> str:
+    """Read a value from Streamlit Secrets, with env fallback for local use."""
     try:
-        value = st.secrets.get("DATABASE_URL", "")
+        value = st.secrets.get(name, "")
     except Exception:
         value = ""
-    value = value or os.environ.get("DATABASE_URL", "")
-    if not value:
-        raise RuntimeError(
-            "DATABASE_URL manquant. Ajoutez DATABASE_URL dans "
-            "Streamlit Cloud > Settings > Secrets."
-        )
-    return value.strip()
+    return str(value or os.environ.get(name, "") or "").strip()
 
 
-@contextmanager
-def get_conn():
-    """Open a PostgreSQL connection and commit/rollback the transaction safely."""
-    with psycopg.connect(database_url(), row_factory=dict_row, connect_timeout=15) as conn:
-        yield conn
+def auth_config() -> sa.AuthConfig:
+    return sa.build_config(get_secret("SUPABASE_URL"), get_secret("SUPABASE_ANON_KEY"))
 
+
+class RestError(RuntimeError):
+    def __init__(self, message: str, status: int = 0, code: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+
+USER_ERRORS = (ValueError, RestError, PermissionError, sa.AuthError)
+
+
+def _rest_request(method, path, *, params=None, payload=None, prefer=None):
+    """PostgREST calls use the user's access token; Supabase validates JWT before RLS."""
+    cfg = auth_config()
+    auth, notice = sa.ensure_session(cfg, st.session_state)
+    session = st.session_state.get(sa.SESSION_KEY) or {}
+    token = session.get("access_token")
+    if not auth or not token:
+        raise PermissionError("Session invalide.")
+    headers = {"apikey": cfg.anon_key, "Authorization": f"Bearer {token}",
+               "Content-Type": "application/json"}
+    if prefer:
+        headers["Prefer"] = prefer
+    try:
+        response = requests.request(method, cfg.url + "/rest/v1/" + path,
+                                    headers=headers, params=params, json=payload, timeout=20)
+    except requests.RequestException as exc:
+        raise RestError("Supabase est temporairement inaccessible.") from exc
+    try:
+        data = response.json() if response.content else None
+    except ValueError:
+        data = None
+    if not response.ok:
+        info = data if isinstance(data, dict) else {}
+        code = str(info.get("code") or "")
+        msg = str(info.get("message") or "")
+        if response.status_code == 401:
+            st.session_state.pop(sa.SESSION_KEY, None)
+            raise PermissionError("Session expirée. Reconnectez-vous.")
+        if code == "23505":
+            msg = "Cet élément existe déjà dans votre espace (référence ou nom en double)."
+        elif code == "23503":
+            msg = "Lien invalide : fournisseur ou produit introuvable dans votre espace."
+        elif code == "23514":
+            msg = "Valeurs refusées (quantités et prix doivent être positifs)."
+        elif response.status_code in (401, 403):
+            msg = "Action non autorisée."
+        else:
+            msg = "Erreur de base de données. Vérifiez la migration et réessayez."
+        raise RestError(msg, response.status_code, code)
+    return data
+
+
+def _rpc(name, payload):
+    return _rest_request("POST", "rpc/" + name, payload=payload, prefer="return=representation")
+
+
+def current_user_id() -> str:
+    return sa.current_user_id(st.session_state)
+
+
+def check_schema():
+    """Verify the multi-user migration using an authenticated PostgREST RPC."""
+    ready = _rpc("stockflow_api_ready", {})
+    if ready is not True:
+        raise SafeError("La base n'est pas prête. Exécutez migrations/001_auth_rls.sql puis migrations/002_rest_rpc.sql dans Supabase SQL Editor.")
+
+
+def db_error_message(exc: Exception) -> str:
+    if isinstance(exc, ValueError):
+        return str(exc)
+    if isinstance(exc, PermissionError):
+        return "Accès refusé ou session expirée. Reconnectez-vous."
+    if isinstance(exc, RestError):
+        return str(exc)
+    log.exception("Erreur de base de données", exc_info=exc)
+    return "Erreur de base de données. Réessayez ; si le problème persiste, contactez l'administrateur."
 
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def rows_df(cursor) -> pd.DataFrame:
-    return pd.DataFrame(cursor.fetchall())
+def rows_df(data) -> pd.DataFrame:
+    return pd.DataFrame(data or [])
 
 
-def init_db():
-    """Create tables and indexes if they do not already exist."""
-    schema = """
-    CREATE TABLE IF NOT EXISTS suppliers (
-        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        name TEXT NOT NULL,
-        phone TEXT NOT NULL DEFAULT '',
-        email TEXT NOT NULL DEFAULT '',
-        notes TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS suppliers_name_lower_unique
-        ON suppliers (LOWER(name));
-
-    CREATE TABLE IF NOT EXISTS products (
-        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        reference TEXT NOT NULL,
-        name TEXT NOT NULL,
-        quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
-        purchase_price DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (purchase_price >= 0),
-        selling_price DOUBLE PRECISION NOT NULL DEFAULT 0 CHECK (selling_price >= 0),
-        min_stock INTEGER NOT NULL DEFAULT 5 CHECK (min_stock >= 0),
-        supplier_id BIGINT REFERENCES suppliers(id) ON DELETE SET NULL,
-        created_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS products_reference_lower_unique
-        ON products (LOWER(reference));
-
-    CREATE TABLE IF NOT EXISTS movements (
-        id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-        product_id BIGINT REFERENCES products(id) ON DELETE SET NULL,
-        product_ref TEXT NOT NULL,
-        product_name TEXT NOT NULL,
-        type TEXT NOT NULL CHECK (type IN ('Entrée', 'Sortie')),
-        quantity INTEGER NOT NULL CHECK (quantity > 0),
-        unit_price DOUBLE PRECISION NOT NULL DEFAULT 0,
-        total_value DOUBLE PRECISION NOT NULL DEFAULT 0,
-        note TEXT NOT NULL DEFAULT '',
-        created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_movements_date ON movements(created_at);
-    CREATE INDEX IF NOT EXISTS idx_movements_product ON movements(product_id);
-    """
-    with get_conn() as conn:
-        conn.execute(schema)
+def _require_row(data):
+    if not data:
+        raise ValueError(NOT_FOUND_MSG)
 
 
 def get_products():
-    with get_conn() as conn:
-        df = rows_df(conn.execute("""
-            SELECT p.*, s.name AS supplier_name
-            FROM products p
-            LEFT JOIN suppliers s ON s.id = p.supplier_id
-            ORDER BY LOWER(p.name)
-        """))
+    data = _rest_request("GET", "products", params={
+        "select": "id,reference,name,quantity,purchase_price,selling_price,min_stock,supplier_id,created_at,suppliers(name)",
+        "order": "name.asc"})
+    flat = []
+    for r in data or []:
+        sup = r.pop("suppliers", None)
+        r["supplier_name"] = (sup or {}).get("name", "") if isinstance(sup, dict) else ""
+        flat.append(r)
+    df = rows_df(flat)
     if df.empty:
         for col in ["stock_value", "sale_value", "profit", "status"]:
             df[col] = pd.Series(dtype="object")
@@ -118,53 +173,49 @@ def get_products():
 
 
 def get_movements():
-    with get_conn() as conn:
-        return rows_df(conn.execute("""
-            SELECT m.*, COALESCE(p.reference, m.product_ref) AS reference,
-                   COALESCE(p.name, m.product_name) AS name
-            FROM movements m
-            LEFT JOIN products p ON p.id = m.product_id
-            ORDER BY m.created_at DESC, m.id DESC
-        """))
+    data = _rest_request("GET", "movements", params={
+        "select": "id,product_id,product_ref,product_name,type,quantity,unit_price,total_value,note,created_at,products(reference,name)",
+        "order": "created_at.desc,id.desc"})
+    flat = []
+    for r in data or []:
+        product = r.pop("products", None)
+        r["reference"] = (product or {}).get("reference") or r.get("product_ref")
+        r["name"] = (product or {}).get("name") or r.get("product_name")
+        flat.append(r)
+    return rows_df(flat)
 
 
 def get_suppliers():
-    with get_conn() as conn:
-        return rows_df(conn.execute("""
-            SELECT s.*, COUNT(p.id)::INTEGER AS products_count
-            FROM suppliers s
-            LEFT JOIN products p ON p.supplier_id = s.id
-            GROUP BY s.id
-            ORDER BY LOWER(s.name)
-        """))
+    suppliers = _rest_request("GET", "suppliers", params={"select": "id,name,phone,email,notes,created_at", "order": "name.asc"}) or []
+    products = _rest_request("GET", "products", params={"select": "supplier_id"}) or []
+    counts = {}
+    for p in products:
+        if p.get("supplier_id") is not None:
+            k = int(p["supplier_id"]); counts[k] = counts.get(k, 0) + 1
+    for supplier in suppliers:
+        supplier["products_count"] = counts.get(int(supplier["id"]), 0)
+    return rows_df(suppliers)
 
 
 def add_supplier(name, phone, email, notes):
     name = name.strip()
     if not name:
         raise ValueError("Le nom du fournisseur est obligatoire.")
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO suppliers(name,phone,email,notes,created_at)
-               VALUES(%s,%s,%s,%s,%s)""",
-            (name, phone.strip(), email.strip(), notes.strip(), now_str()),
-        )
+    _rest_request("POST", "suppliers", payload={"name": name, "phone": phone.strip(),
+        "email": email.strip(), "notes": notes.strip(), "created_at": now_str()}, prefer="return=minimal")
 
 
 def update_supplier(sid, name, phone, email, notes):
     if not name.strip():
         raise ValueError("Le nom du fournisseur est obligatoire.")
-    with get_conn() as conn:
-        conn.execute(
-            """UPDATE suppliers SET name=%s,phone=%s,email=%s,notes=%s
-               WHERE id=%s""",
-            (name.strip(), phone.strip(), email.strip(), notes.strip(), int(sid)),
-        )
+    data = _rest_request("PATCH", "suppliers", params={"id": f"eq.{int(sid)}", "select": "id"},
+        payload={"name": name.strip(), "phone": phone.strip(), "email": email.strip(), "notes": notes.strip()}, prefer="return=representation")
+    _require_row(data)
 
 
 def delete_supplier(sid):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM suppliers WHERE id=%s", (int(sid),))
+    data = _rest_request("DELETE", "suppliers", params={"id": f"eq.{int(sid)}", "select": "id"}, prefer="return=representation")
+    _require_row(data)
 
 
 def add_product(ref, name, qty, buy, sell, min_stock, supplier_id):
@@ -173,23 +224,10 @@ def add_product(ref, name, qty, buy, sell, min_stock, supplier_id):
         raise ValueError("La référence et le nom du produit sont obligatoires.")
     if int(qty) < 0 or int(min_stock) < 0 or float(buy) < 0 or float(sell) < 0:
         raise ValueError("Quantités et prix doivent être positifs ou nuls.")
-    with get_conn() as conn:
-        row = conn.execute(
-            """INSERT INTO products
-               (reference,name,quantity,purchase_price,selling_price,min_stock,supplier_id,created_at)
-               VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
-            (ref, name, int(qty), float(buy), float(sell), int(min_stock),
-             supplier_id, now_str()),
-        ).fetchone()
-        pid = row["id"]
-        if int(qty) > 0:
-            conn.execute(
-                """INSERT INTO movements
-                   (product_id,product_ref,product_name,type,quantity,unit_price,total_value,note,created_at)
-                   VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-                (pid, ref, name, MOVE_IN, int(qty), float(buy),
-                 int(qty) * float(buy), "Stock initial", now_str()),
-            )
+    _rpc("stockflow_add_product", {"p_reference": ref, "p_name": name, "p_quantity": int(qty),
+        "p_purchase_price": float(buy), "p_selling_price": float(sell), "p_min_stock": int(min_stock),
+        "p_supplier_id": int(supplier_id) if supplier_id not in (None, "", 0) else None,
+        "p_created_at": now_str()})
 
 
 def update_product(pid, ref, name, buy, sell, min_stock, supplier_id):
@@ -197,18 +235,16 @@ def update_product(pid, ref, name, buy, sell, min_stock, supplier_id):
         raise ValueError("La référence et le nom sont obligatoires.")
     if float(buy) < 0 or float(sell) < 0 or int(min_stock) < 0:
         raise ValueError("Quantités et prix doivent être positifs ou nuls.")
-    with get_conn() as conn:
-        conn.execute(
-            """UPDATE products SET reference=%s,name=%s,purchase_price=%s,
-               selling_price=%s,min_stock=%s,supplier_id=%s WHERE id=%s""",
-            (ref.strip(), name.strip(), float(buy), float(sell), int(min_stock),
-             supplier_id, int(pid)),
-        )
+    data = _rest_request("PATCH", "products", params={"id": f"eq.{int(pid)}", "select": "id"}, payload={
+        "reference": ref.strip(), "name": name.strip(), "purchase_price": float(buy), "selling_price": float(sell),
+        "min_stock": int(min_stock), "supplier_id": int(supplier_id) if supplier_id not in (None, "", 0) else None},
+        prefer="return=representation")
+    _require_row(data)
 
 
 def delete_product(pid):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM products WHERE id=%s", (int(pid),))
+    data = _rest_request("DELETE", "products", params={"id": f"eq.{int(pid)}", "select": "id"}, prefer="return=representation")
+    _require_row(data)
 
 
 def add_movement(pid, typ, qty, note="", unit_price=None):
@@ -217,34 +253,17 @@ def add_movement(pid, typ, qty, note="", unit_price=None):
         raise ValueError("La quantité doit être au moins 1.")
     if typ not in (MOVE_IN, MOVE_OUT):
         raise ValueError("Type de mouvement invalide.")
-    with get_conn() as conn:
-        # Lock the selected product row to avoid concurrent stock updates conflicting.
-        p = conn.execute(
-            "SELECT * FROM products WHERE id=%s FOR UPDATE", (int(pid),)
-        ).fetchone()
-        if not p:
-            raise ValueError("Produit introuvable.")
-        newqty = p["quantity"] + qty if typ == MOVE_IN else p["quantity"] - qty
-        if newqty < 0:
-            raise ValueError(
-                f"Stock insuffisant : {p['quantity']} unité(s) disponible(s)."
-            )
-        price = float(
-            unit_price if unit_price is not None
-            else (p["selling_price"] if typ == MOVE_OUT else p["purchase_price"])
-        )
-        if price < 0:
-            raise ValueError("Le prix ne peut pas être négatif.")
-        conn.execute("UPDATE products SET quantity=%s WHERE id=%s", (newqty, int(pid)))
-        conn.execute(
-            """INSERT INTO movements
-               (product_id,product_ref,product_name,type,quantity,unit_price,total_value,note,created_at)
-               VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (int(pid), p["reference"], p["name"], typ, qty, price, qty * price,
-             (note or "").strip()[:250], now_str()),
-        )
-    return newqty
-
+    result = _rpc("stockflow_add_movement", {"p_product_id": int(pid), "p_type": typ,
+        "p_quantity": qty, "p_note": (note or "").strip()[:250],
+        "p_unit_price": float(unit_price) if unit_price is not None else None,
+        "p_created_at": now_str()})
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        return int(result[0].get("new_quantity", 0))
+    if isinstance(result, dict):
+        return int(result.get("new_quantity", 0))
+    if isinstance(result, (int, float)):
+        return int(result)
+    raise RestError("Réponse inattendue de Supabase pour le mouvement de stock.")
 
 def money(x):
     return f"{float(x):,.2f} DH".replace(",", " ")
@@ -428,8 +447,8 @@ def products_page():
                 add_product(ref, name, qty, buy, sell, minimum, supplier_names.get(sn))
                 st.success("Produit ajouté.")
                 st.rerun()
-            except (ValueError, psycopg.Error) as e:
-                st.error(f"Impossible d'ajouter le produit : {e}")
+            except USER_ERRORS as e:
+                st.error(f"Impossible d'ajouter le produit : {db_error_message(e)}")
     with t3:
         if p.empty:
             st.info("Aucun produit à modifier.")
@@ -455,8 +474,8 @@ def products_page():
                     update_product(pid, ref, name, buy, sell, minimum, supplier_names.get(sn))
                     st.success("Produit modifié.")
                     st.rerun()
-                except (ValueError, psycopg.Error) as e:
-                    st.error(f"Modification impossible : {e}")
+                except USER_ERRORS as e:
+                    st.error(f"Modification impossible : {db_error_message(e)}")
             st.divider()
             confirm = st.checkbox("Je confirme la suppression définitive", key=f"confirm_del_{pid}")
             if st.button("Supprimer ce produit", disabled=not confirm):
@@ -464,8 +483,8 @@ def products_page():
                     delete_product(pid)
                     st.success("Produit supprimé.")
                     st.rerun()
-                except psycopg.Error as e:
-                    st.error(str(e))
+                except USER_ERRORS as e:
+                    st.error(db_error_message(e))
 
 
 def movements_page():
@@ -492,8 +511,8 @@ def movements_page():
                     newqty = add_movement(pid, typ, qty, note, price)
                     st.success(f"Mouvement enregistré. Nouveau stock : {newqty} unité(s).")
                     st.rerun()
-                except (ValueError, psycopg.Error) as e:
-                    st.error(str(e))
+                except USER_ERRORS as e:
+                    st.error(db_error_message(e))
     with t2:
         m = get_movements()
         if m.empty:
@@ -547,8 +566,8 @@ def suppliers_page():
                 add_supplier(name, phone, email, notes)
                 st.success("Fournisseur ajouté.")
                 st.rerun()
-            except (ValueError, psycopg.Error) as e:
-                st.error(f"Ajout impossible : {e}")
+            except USER_ERRORS as e:
+                st.error(f"Ajout impossible : {db_error_message(e)}")
     with t3:
         if s.empty:
             st.info("Aucun fournisseur à modifier.")
@@ -567,8 +586,8 @@ def suppliers_page():
                     update_supplier(sid, name, phone, email, notes)
                     st.success("Fournisseur modifié.")
                     st.rerun()
-                except (ValueError, psycopg.Error) as e:
-                    st.error(f"Modification impossible : {e}")
+                except USER_ERRORS as e:
+                    st.error(f"Modification impossible : {db_error_message(e)}")
             st.caption("Si vous supprimez un fournisseur, les produits liés restent dans l'inventaire mais sans fournisseur.")
             confirm = st.checkbox("Confirmer la suppression", key=f"confirm_supplier_{sid}")
             if st.button("Supprimer le fournisseur", disabled=not confirm):
@@ -576,8 +595,8 @@ def suppliers_page():
                     delete_supplier(sid)
                     st.success("Fournisseur supprimé.")
                     st.rerun()
-                except psycopg.Error as e:
-                    st.error(str(e))
+                except USER_ERRORS as e:
+                    st.error(db_error_message(e))
 
 
 def backup_page():
@@ -593,6 +612,7 @@ def backup_page():
     sup = s.rename(columns={"name": "Fournisseur", "phone": "Téléphone", "email": "Email",
         "notes": "Notes", "products_count": "Produits liés", "created_at": "Créé le"})
     st.write("Téléchargez une copie des produits, des mouvements et des fournisseurs.")
+    st.caption("Ces fichiers ne contiennent que les données de votre compte.")
     st.download_button("Télécharger la sauvegarde Excel complète",
         excel_bytes({"Inventaire": inv, "Mouvements": hist, "Fournisseurs": sup}),
         f"stockflow_backup_{datetime.now():%Y%m%d_%H%M}.xlsx",
@@ -602,19 +622,108 @@ def backup_page():
     st.download_button("Télécharger les fournisseurs CSV", csv_bytes(sup), "stockflow_fournisseurs.csv", "text/csv")
     st.divider()
     st.subheader("☁️ Base de données PostgreSQL (Supabase)")
-    st.success("Les données sont enregistrées dans PostgreSQL via DATABASE_URL. Elles ne dépendent pas du fichier local SQLite.")
+    st.success("Les données sont enregistrées dans Supabase via l’API authentifiée. Elles ne dépendent pas du fichier local SQLite.")
     st.caption("Pensez à télécharger régulièrement une sauvegarde Excel.")
+
+
+# ---------------------------------------------------------------------------
+# Authentification (interface)
+# ---------------------------------------------------------------------------
+def auth_page(cfg: sa.AuthConfig, notice: str | None = None):
+    """Page de connexion / inscription — la SEULE page visible sans session."""
+    st.markdown(
+        '<div class="hero"><h2>📦 StockFlow Maroc</h2>'
+        "<p>Gestion de stock sécurisée : chaque compte dispose de son propre espace privé "
+        "(produits, fournisseurs et mouvements). Montants en dirhams marocains (DH).</p></div>",
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([1, 1.6, 1])
+    with mid:
+        if notice:
+            st.warning(notice)
+        flash = st.session_state.pop("auth_notice", None)
+        if flash:
+            st.info(flash)
+        tab_in, tab_up = st.tabs(["🔐 Connexion", "📝 Créer un compte"])
+        with tab_in:
+            with st.form("login_form"):
+                email = st.text_input("Email")
+                password = st.text_input("Mot de passe", type="password")
+                submit = st.form_submit_button("Se connecter", type="primary")
+            if submit:
+                try:
+                    session = sa.sign_in(cfg, email, password)
+                except sa.AuthError as e:
+                    st.error(e.message)
+                else:
+                    sa.start_session(st.session_state, session)
+                    st.rerun()
+        with tab_up:
+            with st.form("signup_form"):
+                new_email = st.text_input("Email", key="signup_email")
+                new_password = st.text_input(
+                    f"Mot de passe (minimum {sa.MIN_PASSWORD_LENGTH} caractères)", type="password")
+                confirm_password = st.text_input("Confirmer le mot de passe", type="password")
+                create = st.form_submit_button("Créer mon compte", type="primary")
+            if create:
+                if new_password != confirm_password:
+                    st.error("Les deux mots de passe ne correspondent pas.")
+                else:
+                    try:
+                        session = sa.sign_up(cfg, new_email, new_password)
+                    except sa.AuthError as e:
+                        st.error(e.message)
+                    else:
+                        if session:
+                            sa.start_session(st.session_state, session)
+                            st.rerun()
+                        # Message volontairement identique que l'adresse soit déjà inscrite ou non
+                        # (évite de révéler quelles adresses ont un compte).
+                        st.success(
+                            "Demande enregistrée. Si la confirmation par email est activée, cliquez sur "
+                            "le lien reçu puis connectez-vous depuis l'onglet « Connexion ». "
+                            "Si vous avez déjà un compte, connectez-vous directement."
+                        )
+        st.caption("🔒 Vos données sont privées : personne d'autre ne peut les voir ni les modifier.")
+
+
+def logout(cfg: sa.AuthConfig):
+    sa.sign_out(cfg, (st.session_state.get(sa.SESSION_KEY) or {}).get("access_token"))
+    st.session_state.clear()  # aucune donnée de cet utilisateur ne reste en mémoire
+    st.session_state["auth_notice"] = "Vous avez été déconnecté."
+    st.rerun()
 
 
 def main():
     st.set_page_config(page_title=APP_NAME, page_icon="📦", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+
+    # --- 1. Authentification : barrière unique devant TOUT le reste -------------
     try:
-        init_db()
-    except (psycopg.Error, RuntimeError, OSError) as e:
-        st.error(f"Impossible de se connecter à PostgreSQL : {e}")
-        st.info("Vérifiez Streamlit Cloud > Settings > Secrets et la valeur de DATABASE_URL. Ne partagez pas publiquement votre mot de passe.")
+        cfg = auth_config()
+    except sa.AuthError as e:
+        st.error(e.message)
         st.stop()
+    auth, notice = sa.ensure_session(cfg, st.session_state)
+    if auth is None:
+        auth_page(cfg, notice)
+        st.stop()  # rien d'autre n'est exécuté sans session valide
+
+    # --- 2. Base de données prête ? (migration appliquée) -----------------------
+    if not st.session_state.get("schema_ok"):
+        try:
+            check_schema()
+        except SafeError as e:
+            st.error(str(e))
+            st.stop()
+        except (RestError, OSError, PermissionError, sa.AuthError) as e:
+            log.exception("Connexion à la base impossible", exc_info=e)
+            st.error("Impossible de se connecter à la base de données.")
+            st.info("Vérifiez Streamlit Cloud > Settings > Secrets (SUPABASE_URL, SUPABASE_ANON_KEY) et que les migrations SQL ont été appliquées. "
+                    "Le détail technique est dans les logs de l'application.")
+            st.stop()
+        st.session_state["schema_ok"] = True
+
     st.sidebar.markdown(f"## 📦 {APP_NAME}")
     st.sidebar.caption("Gestion de stock pour les petites entreprises marocaines")
     pages = {
@@ -626,16 +735,22 @@ def main():
     }
     page = st.sidebar.radio("Navigation", list(pages), label_visibility="collapsed")
     st.sidebar.divider()
-    st.sidebar.caption("Base de données : Supabase PostgreSQL")
-    p, m, s = get_products(), get_movements(), get_suppliers()
-    st.sidebar.download_button(
-        "⬇️ Sauvegarde Excel",
-        excel_bytes({"Inventaire": p, "Mouvements": m, "Fournisseurs": s}),
-        f"stockflow_backup_{datetime.now():%Y%m%d}.xlsx",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    pages[page]()
+    st.sidebar.caption(f"👤 Connecté : {auth['email']}")
+    if st.sidebar.button("🚪 Se déconnecter", key="logout_button"):
+        logout(cfg)
+    st.sidebar.caption("Base de données : Supabase (JWT + RLS)")
+    try:
+        p, m, s = get_products(), get_movements(), get_suppliers()
+        st.sidebar.download_button(
+            "⬇️ Sauvegarde Excel",
+            excel_bytes({"Inventaire": p, "Mouvements": m, "Fournisseurs": s}),
+            f"stockflow_backup_{datetime.now():%Y%m%d}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        pages[page]()
+    except (RestError, PermissionError, sa.AuthError) as e:
+        st.error(db_error_message(e))
 
 
 if __name__ == "__main__":
